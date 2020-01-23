@@ -1,0 +1,714 @@
+---
+title: "Classical Test Theory & Item Response Theory"
+date: "`r format(Sys.Date(), '%A %d %B %Y')`"
+output:
+  html_document:
+    theme: united
+  runtime: shiny
+---
+
+
+```{r knitr_init, echo=FALSE, cache=FALSE}
+
+
+library(knitr)
+library(jsonlite)
+library(magrittr)
+#library(tidyverse)
+library(mirt)
+library(epmr)
+library(DT)
+library(shiny)
+library(shinythemes)
+library(ggplot2)
+library(purrr)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(tibble)
+#library(devtools)
+
+
+```
+
+
+```{r} 
+MyTabOptions <- function(center) {
+  list(
+    dom = "Bfrtip",
+    pageLength = 10,
+    buttons = list(
+      c('csv', 'excel'),
+      list(
+        extend = "collection",
+        text = 'Show All',
+        action = DT::JS(
+          "function (e, dt, node, config ) {
+          dt.page.len(-1);
+          dt.ajax.reload();}"
+          )
+        ),
+      list(
+        extend = "collection",
+        text = "Show Less",
+        action = DT::JS(
+          "function ( e, dt, node, config ) {
+           dt.page.len(10);
+           dt.ajax.reload();}"
+          )
+        )
+      ),
+    columnDefs = list(list(className = 'dt-center', targets = center)),
+    deferRender = TRUE,
+    lengthMenu = list(c(10, 20,-1), c('10', '20', 'All')),
+    searching = FALSE,
+    editable = FALSE,
+    scroller = TRUE,
+    lengthChange = FALSE,
+    initComplete = JS(
+      "function(settings, json) {",
+      "$(this.api().table().header()).css({'background-color': '#517fb9', 'color': '#ffffff'});",
+      "}"
+      )
+    )
+}
+
+myDT = function(dt, center, ...){
+  datatable(
+    data = dt,
+    rownames = FALSE,
+    filter = 'none',
+    extensions = 'Buttons', 
+    class = "cell-border", # "cell-border" or "compact"
+    style = "default", # "bootstrap
+    escape = FALSE,
+    options = MyTabOptions(center),
+    ...
+    ) %>%
+  formatStyle(
+    columns = 0:ncol(dt),
+    target = 'row',
+    color = "white",
+    backgroundColor = "darkred"
+    )
+  }
+```
+
+
+# {.tabset .tabset-fade .tabset-pills}
+
+
+## Data Preprocessing 
+
+
+1) The items which are **edited only** by the player or the computer are removed.
+
+2) The items with only a unique value (i.e. only zeros or ones) are removed. 
+
+
+```{r}
+# Change ONLY the line below
+setwd("path to where the playthroughs are stored")
+
+data_original = 
+  fromJSON(
+    txt = "playthroughs.json", 
+    simplifyDataFrame = TRUE,
+    flatten = TRUE
+    )
+```
+
+
+```{r}
+data_v1 = 
+  data_original %>%
+  as_tibble() %>%
+  dplyr::select(scenarioID, history.dialogue) %>%
+  arrange(scenarioID) %>%
+  mutate(
+    design_v1 = 
+      map(
+        .x = history.dialogue, 
+        .f = 
+          function(z) {
+            dat = 
+              filter(z, is_in(str_to_lower(type), c("computer", "player"))) %>%
+              dplyr::select(id, type) %>%
+              group_by(type) %>%
+              mutate(id2 = row_number()) %>%
+              pivot_wider(
+                id_cols = id2,
+                names_from = type,
+                values_from = id, 
+                values_fill = list(id = NA)
+                ) %>%
+              dplyr::select(-id2) %>%
+              na.omit()
+            return(dat)
+            }
+        )
+    )
+```
+
+
+```{r}
+data_v2 = 
+  mutate(
+    data_v1,
+    design_v2 = 
+      map(
+        .x = design_v1, 
+        .f = 
+          function(dat) {
+            # test if the dialogue is between computer and player (not only computer or player alone)
+            if(ncol(dat) >= 2) 
+              {
+              final = 
+                dat %>%
+                mutate_all(
+                  .f =
+                    ~str_replace_all(.x, "[[:alpha:]|[:punct:]]", " ") %>%
+                    str_squish() %>%
+                    str_replace_all("\\s+", "\\.")
+                  ) %>%
+                transmute(
+                  id = str_c("c", computer," + p", player, sep = ""),
+                  value = 1
+                  ) %>%
+                as.data.frame() %>%
+                set_rownames(.$id) %>%
+                dplyr::select(-id) %>%
+                t() %>%
+                as_tibble()
+              } else {
+                final = NULL
+              }
+            return(final)
+            }
+        )
+    )
+```
+
+
+```{r}
+list_scenario =
+  data_v2 %>%
+  split(f = .[["scenarioID"]]) %>%
+  map(
+    ~.x %$% design_v2 %>% 
+      bind_rows() %>% 
+      mutate_all(~replace(., is.na(.), 0))
+    ) 
+```
+
+
+```{r}
+list_scenario %>% 
+  map_df(
+    ~dim(.) %>% 
+      set_names(c("# Observations", "# Items")) %>% 
+      enframe %>% 
+      pivot_wider(names_from = name, values_from = value), 
+    .id = "Scenario"
+    ) %>%
+  myDT(center = 0:2)
+```
+
+
+## Classical Test Theory 
+
+Three statistics are commonly used to evaluate the items within a test (or scale). These statistics are  
+
+* **Item Difficulty:** In CTT, the item difficulty is simply the mean score for an item. For dichotomous 0/1 items, this mean is referred to as the proportion of one's, since it represents the proportion of examinees getting the item correct.
+
+* **Item Discrimination:** In CTT discrimination tells us how item difficulty changes for individuals of different abilities. Item discrimination is often estimated using the correlation between item responses and total scores where the item of interest is excluded from total scores.
+
+* **Internal Consistency Reliability:** Cronbach's Alpha tells us how well the set of items work together (i.e. how consistently the item responses change). An item contribution to internal consistency is measured by estimating alpha without the item of interest.  
+
+
+```{r} 
+myCTT = function(scene) {
+  
+  ctt_output = istudy(list_scenario[[scene]])
+  
+  diff_dt = 
+    ctt_output$items %>%
+    as.data.frame() %>%
+    rownames_to_column("Item") %>%
+    dplyr::select("Item", "Difficulty" = "m") %>%
+    mutate(Difficulty = round(Difficulty, 3)) %>%
+    myDT(center = 1)
+  
+  diff_gg = 
+    ctt_output$items %>%
+    as.data.frame() %>%
+    rownames_to_column("Item") %>%
+    {bind_rows(arrange(., desc(m)) %>% head(10) %>% mutate(grp = "Easy Item"), 
+               arrange(., desc(m)) %>% tail(10) %>% mutate(grp = "Difficult Item"))} %>%
+    ggplot(aes(x = reorder(Item, m), y = m, fill = grp)) +
+    geom_bar(position = position_dodge(.2), stat = "identity") +
+    facet_wrap(~ grp, ncol = 1, scales = "free") +
+    scale_fill_viridis_d() +
+    #scale_y_continuous(labels = function(x) scales::percent(x, accuracy = 0.001)) +
+    theme_bw() +
+    labs(x = "", y = "", title = "Top 10 difficult & easiest items") +
+    theme(legend.position = "none", 
+          axis.text.x = element_text(angle = 20, size = 9, vjust = 1, hjust = 1, face = "bold"))
+  
+  disc_dt = 
+    ctt_output$items %>%
+    as.data.frame() %>%
+    rownames_to_column("Item") %>%
+    dplyr::select("Item", "Discrimination" = "citc") %>%
+    mutate(Discrimination = round(Discrimination, 3)) %>%
+    myDT(center = 1)
+  
+  disc_gg = 
+    ctt_output$items %>%
+    as.data.frame() %>%
+    rownames_to_column("Item") %>%
+    {bind_rows(arrange(., desc(abs(citc))) %>% head(10) %>% mutate(grp = "High Discrimination"), 
+               arrange(., desc(abs(citc))) %>% tail(10) %>% mutate(grp = "Low Discrimination"))} %>%
+    ggplot(aes(x = reorder(Item, citc), y = citc, fill = grp)) +
+    geom_bar(position = position_dodge(.2), stat = "identity") +
+    facet_wrap(~ grp, ncol = 1, scales = "free") +
+    scale_fill_viridis_d() +
+    theme_bw() +
+    labs(x = "", y = "", title = "Top 10 high & low discriminant items") +
+    theme(legend.position = "none", 
+          axis.text.x = element_text(angle = 20, size = 9, vjust = 1, hjust = 1, face = "bold"))
+  
+  alfa = round(ctt_output$alpha, 3)
+  alfa_dt = 
+    ctt_output$items %>%
+    as.data.frame() %>%
+    rownames_to_column("Item") %>%
+    dplyr::select("Item", "Alpha" = "aid") %>%
+    mutate(Alpha = round(Alpha, 3)) %>%
+    myDT(center = 1, caption = str_c("Overall Cronbach Alpha: ", alfa))
+  
+  alfa_gg = 
+    ctt_output$items %>%
+    as.data.frame() %>%
+    rownames_to_column("Item") %>%
+    {bind_rows(arrange(., desc(aid)) %>% head(10) %>% mutate(grp = "High Reliability"), 
+               arrange(., desc(aid)) %>% tail(10) %>% mutate(grp = "Low Reliability"))} %>%
+    ggplot(aes(x = reorder(Item, aid), y = aid, fill = grp)) +
+    geom_bar(position = position_dodge(.2), stat = "identity") +
+    facet_wrap(~ grp, ncol = 1, scales = "free") +
+    scale_fill_viridis_d() +
+    theme_bw() +
+    labs(x = "", y = "", title = "Top 10 high & low reliable items") +
+    theme(legend.position = "none", 
+          axis.text.x = element_text(angle = 20, size = 9, vjust = 1, hjust = 1, face = "bold"))
+  
+  return(list(diff_dt = diff_dt, diff_gg = diff_gg, 
+              disc_dt = disc_dt, disc_gg = disc_gg, 
+              alfa_dt = alfa_dt, alfa_gg = alfa_gg))
+}
+```
+
+
+
+```{r shinyapp} 
+shinyApp(
+  ui = 
+    navbarPage(
+      theme = shinytheme("united"),
+      title =  "Classical Test Theory Analysis",
+      tabPanel(
+        title = "Results",
+        sidebarLayout( 
+          sidebarPanel(
+            width = 2,
+            selectizeInput(
+              inputId = "scene",
+              label = "Select Scenario",
+              choices = names(list_scenario),
+              multiple = FALSE
+              )
+            ),
+        mainPanel(
+          width = 10,
+          tabsetPanel(
+            type = "pills",
+            tabPanel(
+              "Item Difficulty",
+              br(),
+              splitLayout(cellWidths = c("45%", "55%"),
+                          DT::dataTableOutput("diff_dt", width = "100%"), 
+                          shiny::plotOutput("diff_gg", height = "650px"))
+              ), 
+            tabPanel(
+              title =  "Item Discrimination",
+              br(),
+              splitLayout(cellWidths = c("45%", "55%"),
+                          DT::dataTableOutput("disc_dt", width = "100%"),
+                          shiny::plotOutput("disc_gg", height = "650px"))
+              ), 
+            tabPanel(
+              title =  "Items Reliability",
+              br(),
+              splitLayout(cellWidths = c("45%", "55%"),
+                          DT::dataTableOutput("alfa_dt"),
+                          shiny::plotOutput("alfa_gg", height = "650px"))
+              )
+            )
+          )
+        )#
+      )
+    ), 
+  server = function(input, output) 
+  {
+    result = reactive({myCTT(input$scene)})
+    output$diff_dt <- DT::renderDataTable({ result()$diff_dt })
+    output$diff_gg <- shiny::renderPlot({ result()$diff_gg })
+    output$disc_dt <- DT::renderDataTable({ result()$disc_dt })
+    output$disc_gg <- shiny::renderPlot({ result()$disc_gg })
+    output$alfa_dt <- DT::renderDataTable({ result()$alfa_dt })
+    output$alfa_gg <- shiny::renderPlot({ result()$alfa_gg })
+    },
+  options = list(height = "700", width = "100%")
+) 
+```
+
+
+## IRT Model
+
+There are several Unidensional IRT models in our case we will use the following
+
+- **Rasch Model: ** The probability of answering a dichotomous item correctly is 
+
+$$P\left(X_{ij} = 1\right) = \frac{exp\left(\theta_{j} - b_{i} \right)}{1+ exp\left(\theta_{j} - b_{i} \right)}$$
+
+- **Two – Parameter logistic model (2PL): ** The probability of answering a dichotomous item correctly is 
+
+$$P\left(X_{ij} = 1\right) = \frac{exp\left( a_{i} \left[\theta_{j} - b_{i} \right] \right)}{1 + exp\left( a_{i} \left[\theta_{j} - b_{i} \right] \right)}$$
+
+- **Three – Parameter logistic model (3PL): ** The probability of answering a dichotomous item correctly is 
+
+$$P\left(X_{ij} = 1\right) = c_{i} + \left(1 - c_{i}\right)  \frac{exp\left( a_{i} \left[\theta_{j} - b_{i} \right] \right)}{1 + exp\left( a_{i} \left[\theta_{j} - b_{i} \right] \right)}$$
+
+***Where***
+
+- $i = 1, ..., N$ represent the test items.
+- $j = 1, ..., M$ represent the distinct test takers.
+- $\theta_{j}$ the ability of the test taker $j$.
+- $b_{i}$ the difficulty parameter of item $i$.
+- $a_{i}$ the discrimination parameter of item $i$.
+- $c_{i}$ the guessing parameter of item $i$.
+
+
+```{r} 
+myIRT_v1 = function(scene, nfact) 
+  {
+  data = # delete items with a unique value
+    list_scenario[[scene]] %>%
+    select_if(~length(unique(.x)) > 1)
+  
+  list_model = 
+    c('Rasch', '2PL', '3PL')
+  
+  list_irt =
+    map(
+      .x = list_model,
+      .f =
+        function(sc) {
+          tryCatch(
+            mirt(
+              data = data,
+              itemtype = sc,
+              model = nfact,
+              method = "EM",
+              TOL = 0.0007
+              ),
+            error = function(e) NA
+            )
+          }
+      ) %>%
+    set_names(list_model)
+  
+  list_performance =
+    map2(
+      .x = list_irt,
+      .y = list_model,
+      .f =
+        function(a, b) {
+          cl = 
+            class(a) %>% 
+            as.character()
+          if (cl == "SingleGroupClass")
+            performance =
+              a@Fit %>%
+              enframe() %>%
+              filter(name %in% c("AIC", "AICc", "BIC", "SABIC", "HQ")) %>%
+              transmute(name = name, value2 = unlist(value)) %>%
+              set_colnames(c("Information Criteria", b))
+          else
+            performance =
+              tibble(name = c("AIC", "AICc", "BIC", "SABIC", "HQ"),
+                     value2 = rep(NA, 5)) %>%
+              set_colnames(c("Information Criteria", b))
+          return(performance)
+        }
+    ) %>%
+    reduce(inner_join, by = "Information Criteria") 
+  
+  caption = 
+    if(nfact == 1) "Unidimentional IRT" else paste0(nfact, " Factors IRT")
+  
+  nc = ncol(list_performance)
+  dt_performance = 
+    list_performance %>%
+    myDT(center = c(1:(nc-1)), caption = caption) %>%
+    formatRound(2:nc, digits = 1)
+  
+  output = 
+    list(dt_performance = dt_performance, 
+         list_irt = list_irt)
+  
+  return(output)
+}
+```
+
+
+```{r}
+# this function depend 100% on the ouput of myIRT_v1.
+myIRT_v2 = function(object, model) 
+  {
+  input = object[["list_irt"]][[model]]
+  
+  cl = 
+    class(input) %>% 
+    as.character()
+  
+  if(cl == "SingleGroupClass") 
+    {
+    mycoef_ = 
+      coef(input, simplify = TRUE) %$% items %>%
+      as.data.frame() %>%
+      rownames_to_column("Item") 
+    
+    test = 
+      extract.mirt(input, "itemtype")
+    
+    if(all(test == "Rasch")) {
+      mycoef_raw = 
+        dplyr::select(mycoef_, Item, starts_with("d")) %>%
+        set_colnames(c("Item", "Difficulty"))
+      } else if(all(test == "2PL")) {
+        mycoef_raw = 
+          dplyr::select(mycoef_, Item, starts_with("d"), starts_with("a")) 
+        nc = ncol(mycoef_raw) - 2
+        colnames(mycoef_raw) = 
+          c("Item", "Difficulty", paste0("Discrimination F", 1:nc))
+        } else if(all(test == "3PL")) {
+          mycoef_raw = 
+            dplyr::select(mycoef_, Item, starts_with("d"), starts_with("a"), starts_with("g")) 
+          nc = ncol(mycoef_raw) - 3
+          colnames(mycoef_raw) = 
+            c("Item", "Difficulty", paste0("Discrimination F", 1:nc), "Guessing") 
+        }
+    
+    mycoef_norm = 
+      inner_join(
+        x =
+          MDIFF(input) %>%
+          as.data.frame() %>%
+          rownames_to_column("Item") %>%
+          set_colnames(c("Item", "Difficulty")),
+        y =
+          MDISC(input) %>%
+          enframe("Item", "Discrimination"),
+        by = "Item"
+        )
+    
+    theta_se =
+      fscores(
+        object = input,
+        full.scores = TRUE,
+        full.scores.SE = TRUE,
+        method = 'MAP', #or 'ML'
+        rotate = "oblimin"
+        )
+    
+    reliability =
+      empirical_rxx(theta_se) %>%
+      enframe(
+        name = "Factor", 
+        value = "Empirical Reliability"
+        )
+    
+    gof =
+      itemfit(
+        x = input,
+        Theta = theta_se,
+        fit_stats = "S_X2",
+        method = "MAP", 
+        mincell = 1
+        ) %>%
+      as.data.frame() %>%
+      dplyr::select(Item = item, RMSEA = RMSEA.S_X2) %>%
+      mutate(
+        "Item-fit" = 
+          cut(
+            x = RMSEA,
+            breaks = c(0, 0.05, 0.08, 0.1, 1),
+            labels = c("Good", "Acceptable", "Bad", "Very Bad")
+            )
+        )
+    
+    } else {
+      stop("The object must be a valid output model of the 'mirt' function. 
+            \nThe class of the object must be 'SingleGroupClass'.
+            \nSelect another :)")
+    }
+  
+  output = 
+    list(mycoef_raw = mycoef_raw, 
+         mycoef_norm = mycoef_norm, 
+         reliability = reliability, 
+         gof = gof)
+  
+  return(output)
+}
+```
+
+
+
+```{r}
+shinyApp(
+  ui = 
+    navbarPage(
+      theme = shinytheme("united"),
+      title =  "IRT & MIRT Analyses",
+      tabPanel(
+        title = "1st Step: Model Comparisons",
+        sidebarLayout( 
+          sidebarPanel(
+            width = 3,
+            selectizeInput(
+              inputId = "scene",
+              label = "Select Scenario",
+              choices = names(list_scenario),
+              multiple = FALSE
+              ), 
+            numericInput(
+              inputId = "nfact", 
+              label = "Select # Factors", 
+              value = 1, 
+              min = 1, 
+              max = 3, 
+              step = 1
+              ), 
+            actionButton(
+              inputId = "run1", 
+              label = "Run", 
+              icon = icon("refresh")
+              )
+            ), #end sidebarPanel
+        mainPanel(
+          width = 9,
+          DT::dataTableOutput("dt_performance", width = "50%")
+          )
+        )# end sidebarLayout
+      ),# end tabPanel
+      tabPanel(
+        title = "2nd Step: Analyse Selected Model", 
+        sidebarLayout(
+          sidebarPanel(
+            width = 3, 
+            selectizeInput(
+              inputId = "model", 
+              label = "Select Model", 
+              choices = c("Rasch", "2PL", "3PL"), 
+              multiple = FALSE
+              ), 
+            actionButton(
+              inputId = "run2", 
+              label = "Run", 
+              icon = icon("refresh")
+              )
+            ), #end sidebarPanel
+          mainPanel(
+            width = 9, 
+            tabsetPanel(
+              type = "pills", 
+              tabPanel(
+                title = "Model Parameter Estimates",
+                br(),
+                DT::dataTableOutput("mycoef_raw", width = "80%")
+                ), 
+              tabPanel(
+                title = "Difficulty & Discrimination",
+                br(),
+                DT::dataTableOutput("mycoef_norm", width = "50%")
+                ), 
+              tabPanel(
+                title = "Estimated Marginal Reliability",
+                br(),
+                DT::dataTableOutput("reliability", width = "50%")
+                ), 
+              tabPanel(
+                title = "Item Fit",
+                br(),
+                DT::dataTableOutput("gof", width = "75%")
+                )
+              )
+            )
+          )
+        ) #end tabPanel
+    ), 
+  server = function(input, output) 
+  {
+    result1 = 
+      eventReactive(input$run1, { myIRT_v1(scene = input$scene, nfact = input$nfact) })
+    
+    output$dt_performance = 
+      DT::renderDT({ result1()$dt_performance })
+    
+    result2 = 
+      eventReactive(input$run2, { myIRT_v2(object = result1(), model = input$model) })
+    
+    output$mycoef_raw =
+      DT::renderDT({
+        out1 = result2()$mycoef_raw
+        myDT(
+          dt = out1, 
+          center = 1:(ncol(out1)-1)
+          ) %>%
+          formatRound(2:ncol(out1))
+      }) 
+    output$mycoef_norm = 
+      DT::renderDT({
+        out2 = result2()$mycoef_norm
+        myDT(
+          dt = out2, 
+          center = 1:(ncol(out2)-1)
+          ) %>%
+          formatRound(2:ncol(out2))
+      }) 
+    output$reliability = 
+      DT::renderDT({
+        out3 = result2()$reliability
+        myDT(
+          dt = out3, 
+          center = 1:(ncol(out3)-1)
+          ) %>%
+          formatRound(2:ncol(out3))
+      }) 
+    output$gof = 
+      DT::renderDT({
+        out4 = result2()$gof
+        myDT(
+          dt = out4, 
+          center = 1:(ncol(out4)-1)
+          ) %>%
+          formatRound(2, digits = 3)
+      }) 
+    },
+  options = list(height = "550px", width = "80%")
+  ) 
+```
+
+
